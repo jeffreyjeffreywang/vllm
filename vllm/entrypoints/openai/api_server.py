@@ -34,7 +34,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
 from vllm.engine.multiprocessing.engine import run_mp_engine
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import DistributedRequestProcessor, EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
@@ -97,6 +97,12 @@ logger = init_logger('vllm.entrypoints.openai.api_server')
 _running_tasks: set[asyncio.Task] = set()
 
 
+def is_running_under_torchrun():
+    logger.info(f"Checking if running under torchrun with env: {os.environ}")
+    return all(var in os.environ
+               for var in ["RANK", "WORLD_SIZE", "LOCAL_RANK"])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -153,6 +159,9 @@ async def build_async_engine_client_from_engine_args(
 
     Returns the Client or None if the creation failed.
     """
+
+    if is_running_under_torchrun():
+        engine_args.distributed_executor_backend = "external_launcher"
 
     # AsyncLLMEngine.
     if (MQLLMEngineClient.is_unsupported_config(engine_args)
@@ -407,7 +416,12 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return base(raw_request).create_error_response(
             message="The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+    distributed_processor = raw_request.app.state.distributed_processor
+    if distributed_processor is not None:
+        generator = await handler.create_chat_completion_distributed(
+            request, raw_request, distributed_processor)
+    else:
+        generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -427,7 +441,13 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Completions API")
 
-    generator = await handler.create_completion(request, raw_request)
+    distributed_processor = raw_request.app.state.distributed_processor
+    if distributed_processor is not None:
+        generator = await handler.create_completion_distributed(
+            request, raw_request, distributed_processor)
+    else:
+        generator = await handler.create_completion(request, raw_request)
+
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
                             status_code=generator.code)
@@ -811,6 +831,17 @@ async def init_app_state(
         BaseModelPath(name=name, model_path=args.model)
         for name in served_model_names
     ]
+
+    if is_running_under_torchrun():
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        logger.info(
+            f"Initializing distributed processor with rank {rank} and world size {world_size}"
+        )
+        state.distributed_processor = DistributedRequestProcessor(
+            rank, world_size)
+    else:
+        state.distributed_processor = None
 
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats

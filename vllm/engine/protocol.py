@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import pickle
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Mapping, Optional
+from typing import Any, AsyncGenerator, List, Mapping, Optional
+
+import numpy as np
+import torch
+import torch.distributed as dist
 
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
 from vllm.config import DecodingConfig, ModelConfig
@@ -292,3 +297,88 @@ class EngineClient(ABC):
     async def add_lora(self, lora_request: LoRARequest) -> None:
         """Load a new LoRA adapter into the engine for future requests."""
         ...
+
+
+class DistributedRequestProcessor:
+    """Handles broadcasting requests to all ranks and collecting results."""
+
+    def __init__(self, rank: int, world_size: int):
+        self.rank = rank
+        self.world_size = world_size
+        self.initialized = False
+
+        if self.world_size > 1:
+            self.init_process_group()
+
+    def init_process_group(self):
+        if not self.initialized:
+            logger.info(f"Initializing process group for rank {self.rank}")
+            dist.init_process_group(backend="nccl",
+                                    init_method="env://",
+                                    rank=self.rank,
+                                    world_size=self.world_size)
+            self.initialized = True
+
+    def broadcast_object(
+        self,
+        data: List[Any],
+        rank: int,
+        dist_group: Optional[torch.distributed.ProcessGroup] = None,
+        src: int = 0,
+    ):
+        """Broadcast inputs from rank=src to all other ranks with torch.distributed backend.
+        
+        Args:
+            data: List of objects to broadcast (only used on src rank)
+            rank: Current process rank
+            dist_group: Process group for distributed communication
+            src: Source rank for broadcast
+            
+        Returns:
+            The broadcasted data list on all ranks
+        """
+        if rank == src:
+            logger.info(f"Broadcasting data from rank {src} to all ranks")
+            # Source rank: serialize the data
+            if len(data) == 0:
+                # Handle empty list case
+                tensor_size = torch.tensor([0],
+                                           dtype=torch.long,
+                                           device="cuda")
+                dist.broadcast(tensor_size, src=src, group=dist_group)
+                return data
+            else:
+                # Serialize the data
+                serialized_data = pickle.dumps(data)
+                size = len(serialized_data)
+
+                # Create tensors for size and data
+                tensor_size = torch.tensor([size],
+                                           dtype=torch.long,
+                                           device="cuda")
+                tensor_data = torch.ByteTensor(
+                    np.frombuffer(serialized_data, dtype=np.uint8)).to("cuda")
+
+                # Broadcast size and data
+                dist.broadcast(tensor_size, src=src, group=dist_group)
+                dist.broadcast(tensor_data, src=src, group=dist_group)
+                return data
+        else:
+            logger.info(f"Receiving data on rank {rank}")
+            # Receiver ranks: get size first
+            tensor_size = torch.tensor([0], dtype=torch.long, device="cuda")
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            size = tensor_size.item()
+
+            # Handle empty list case
+            if size == 0:
+                return []
+
+            # Receive the data
+            tensor_data = torch.empty(size, dtype=torch.uint8, device="cuda")
+            dist.broadcast(tensor_data, src=src, group=dist_group)
+
+            # Deserialize the data
+            serialized_data = bytes(tensor_data.cpu().numpy())
+            data = pickle.loads(serialized_data)
+            return data
