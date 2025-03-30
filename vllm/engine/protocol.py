@@ -312,11 +312,15 @@ class DistributedRequestProcessor:
 
     def init_process_group(self):
         if not self.initialized:
-            logger.info(f"Initializing process group for rank {self.rank}")
-            dist.init_process_group(backend="nccl",
-                                    init_method="env://",
-                                    rank=self.rank,
-                                    world_size=self.world_size)
+            logger.info(f"Initializing device mesh for rank {self.rank}")
+            # dist.init_process_group(backend="gloo",
+            #                         init_method="env://",
+            #                         rank=self.rank,
+            #                         world_size=self.world_size)
+            device_mesh_kwargs = dict(mesh_shape=(self.world_size, ),
+                                      mesh_dim_names=["tp"])
+            dist.init_device_mesh("cpu", **device_mesh_kwargs)
+            logger.info(f"Initialized device mesh for rank {self.rank}")
             self.initialized = True
 
     def broadcast_object(
@@ -339,46 +343,35 @@ class DistributedRequestProcessor:
         """
         if rank == src:
             logger.info(f"Broadcasting data from rank {src} to all ranks")
-            # Source rank: serialize the data
+
             if len(data) == 0:
-                # Handle empty list case
-                tensor_size = torch.tensor([0],
-                                           dtype=torch.long,
-                                           device="cuda")
+                tensor_size = torch.tensor([0], dtype=torch.long)
                 dist.broadcast(tensor_size, src=src, group=dist_group)
                 return data
             else:
-                # Serialize the data
                 serialized_data = pickle.dumps(data)
                 size = len(serialized_data)
 
-                # Create tensors for size and data
-                tensor_size = torch.tensor([size],
-                                           dtype=torch.long,
-                                           device="cuda")
+                tensor_size = torch.tensor([size], dtype=torch.long)
                 tensor_data = torch.ByteTensor(
-                    np.frombuffer(serialized_data, dtype=np.uint8)).to("cuda")
+                    np.frombuffer(serialized_data, dtype=np.uint8))
 
-                # Broadcast size and data
                 dist.broadcast(tensor_size, src=src, group=dist_group)
                 dist.broadcast(tensor_data, src=src, group=dist_group)
                 return data
         else:
             logger.info(f"Receiving data on rank {rank}")
-            # Receiver ranks: get size first
-            tensor_size = torch.tensor([0], dtype=torch.long, device="cuda")
+
+            tensor_size = torch.tensor([0], dtype=torch.long)
             dist.broadcast(tensor_size, src=src, group=dist_group)
             size = tensor_size.item()
 
-            # Handle empty list case
             if size == 0:
                 return []
 
-            # Receive the data
-            tensor_data = torch.empty(size, dtype=torch.uint8, device="cuda")
+            tensor_data = torch.empty(size, dtype=torch.uint8)
             dist.broadcast(tensor_data, src=src, group=dist_group)
 
-            # Deserialize the data
             serialized_data = bytes(tensor_data.cpu().numpy())
             data = pickle.loads(serialized_data)
             return data

@@ -443,6 +443,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     distributed_processor = raw_request.app.state.distributed_processor
     if distributed_processor is not None:
+        logger.info(
+            f"Creating completion for rank {distributed_processor.rank} with distributed processor"
+        )
         generator = await handler.create_completion_distributed(
             request, raw_request, distributed_processor)
     else:
@@ -959,15 +962,27 @@ async def run_server(args, **uvicorn_kwargs) -> None:
             f"invalid reasoning parser: {args.reasoning_parser} "
             f"(chose from {{ {','.join(valid_reasoning_parses)} }})")
 
-    # workaround to make sure that we bind the port before the engine is set up.
-    # This avoids race conditions with ray.
-    # see https://github.com/vllm-project/vllm/issues/8204
-    sock_addr = (args.host or "", args.port)
-    sock = create_server_socket(sock_addr)
+    # Check if running under torchrun
+    is_distributed = is_running_under_torchrun()
+    rank = 0
+    if is_distributed:
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        logger.info(
+            f"Running in distributed mode with rank {rank} of {world_size}")
 
-    # workaround to avoid footguns where uvicorn drops requests with too
-    # many concurrent requests active
-    set_ulimit()
+    # Only rank 0 needs to create a socket for HTTP server
+    sock = None
+    if not is_distributed or rank == 0:
+        # workaround to make sure that we bind the port before the engine is set up.
+        # This avoids race conditions with ray.
+        # see https://github.com/vllm-project/vllm/issues/8204
+        sock_addr = (args.host or "", args.port)
+        sock = create_server_socket(sock_addr)
+
+        # workaround to avoid footguns where uvicorn drops requests with too
+        # many concurrent requests active
+        set_ulimit()
 
     def signal_handler(*_) -> None:
         # Interrupt server on sigterm while initializing
@@ -976,38 +991,70 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     async with build_async_engine_client(args) as engine_client:
+        logger.info(f"Initializing app for rank {rank}")
         app = build_app(args)
 
         model_config = await engine_client.get_model_config()
         await init_app_state(engine_client, model_config, app.state, args)
 
-        def _listen_addr(a: str) -> str:
-            if is_valid_ipv6_address(a):
-                return '[' + a + ']'
-            return a or "0.0.0.0"
+        # Only rank 0 serves HTTP requests
+        if not is_distributed or rank == 0:
 
-        logger.info("Starting vLLM API server on http://%s:%d",
-                    _listen_addr(sock_addr[0]), sock_addr[1])
+            def _listen_addr(a: str) -> str:
+                if is_valid_ipv6_address(a):
+                    return '[' + a + ']'
+                return a or "0.0.0.0"
 
-        shutdown_task = await serve_http(
-            app,
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            **uvicorn_kwargs,
-        )
+            logger.info("Starting vLLM API server on http://%s:%d",
+                        _listen_addr(sock_addr[0]), sock_addr[1])
 
-    # NB: Await server shutdown only after the backend context is exited
-    await shutdown_task
+            shutdown_task = await serve_http(
+                app,
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                **uvicorn_kwargs,
+            )
 
-    sock.close()
+            # NB: Await server shutdown only after the backend context is exited
+            await shutdown_task
+            sock.close()
+        else:
+            # Non-zero ranks don't serve HTTP but need to keep running to participate in distributed processing
+            logger.info(
+                f"Rank {rank} initialized and waiting for requests from rank 0"
+            )
+
+            completion_handler = app.state.openai_serving_completion
+            dummy_completion_request = CompletionRequest(model="dummy",
+                                                         prompt="")
+
+            # Keep the process alive to participate in distributed processing
+            try:
+                while True:
+                    try:
+                        # Process completion requests
+                        result = await completion_handler.create_completion_distributed(
+                            dummy_completion_request, None,
+                            app.state.distributed_processor)
+
+                        async for _ in result:
+                            pass
+                        # Sleep briefly to avoid busy waiting
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.error(f"Error in non-zero rank processing: {e}")
+                        # Sleep a bit longer after an error
+                        await asyncio.sleep(1)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info(f"Rank {rank} shutting down")
 
 
 if __name__ == "__main__":

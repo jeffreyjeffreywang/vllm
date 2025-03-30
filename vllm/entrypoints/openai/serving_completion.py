@@ -246,6 +246,9 @@ class OpenAIServingCompletion(OpenAIServing):
         Receive request from rank 0 and process through its own engine
         w/ self.engine_client.generate(). Only rank 0 will return a response.
         """
+        logger.info(
+            f"Rank {distributed_processor.rank} is starting create_completion_distributed"
+        )
         if distributed_processor.rank == 0:
             logger.info(
                 f"Rank {distributed_processor.rank} starting preprocessing")
@@ -275,6 +278,7 @@ class OpenAIServingCompletion(OpenAIServing):
             request_metadata = RequestResponseMetadata(request_id=request_id)
             if raw_request:
                 raw_request.state.request_metadata = request_metadata
+            logger.info(f"Request metadata: {request_metadata}")
 
             try:
                 (
@@ -298,11 +302,12 @@ class OpenAIServingCompletion(OpenAIServing):
 
             model_name = self._get_model_name(request.model, lora_request)
             num_prompts = len(engine_prompts)
+            logger.info(
+                f"Rank {distributed_processor.rank} has pre-processed completion request; model_name: {model_name}, num_prompts: {num_prompts}"
+            )
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
-
-        dist.barrier()
 
         # Broadcast engine_prompts to all ranks
         if distributed_processor.rank == 0:
@@ -316,6 +321,7 @@ class OpenAIServingCompletion(OpenAIServing):
         engine_prompts_to_broadcast = distributed_processor.broadcast_object(
             engine_prompts_to_broadcast, distributed_processor.rank, src=0)
 
+        num_prompts = len(engine_prompts_to_broadcast)
         try:
             for i, engine_prompt in enumerate(engine_prompts_to_broadcast):
                 if distributed_processor.rank == 0:
@@ -348,26 +354,37 @@ class OpenAIServingCompletion(OpenAIServing):
 
                     # Broadcast all necessary generation inputs to other ranks
                     generation_inputs = distributed_processor.broadcast_object(
-                        engine_prompt=engine_prompt,
-                        sampling_params=sampling_params,
-                        request_id=request_id_item,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        prompt_adapter_request=prompt_adapter_request,
-                        priority=priority,
+                        {
+                            "engine_prompt": engine_prompt,
+                            "sampling_params": sampling_params,
+                            "request_id": request_id,
+                            "request_id_item": request_id_item,
+                            "lora_request": lora_request,
+                            "trace_headers": trace_headers,
+                            "prompt_adapter_request": prompt_adapter_request,
+                            "priority": priority,
+                            "model_name": model_name,
+                            "request_prompts": request_prompts,
+                        },
+                        distributed_processor.rank,
+                        src=0,
                     )
                 else:
                     generation_inputs = distributed_processor.broadcast_object(
-                    )
+                        None, distributed_processor.rank, src=0)
+                    logger.info(
+                        f"Received generation inputs: {generation_inputs}")
                     engine_prompt = generation_inputs["engine_prompt"]
                     sampling_params = generation_inputs["sampling_params"]
-                    request_id_item = generation_inputs["request_id"]
+                    request_id = generation_inputs["request_id"]
+                    request_id_item = generation_inputs["request_id_item"]
                     lora_request = generation_inputs["lora_request"]
                     trace_headers = generation_inputs["trace_headers"]
                     prompt_adapter_request = generation_inputs[
                         "prompt_adapter_request"]
                     priority = generation_inputs["priority"]
-
+                    model_name = generation_inputs["model_name"]
+                    request_prompts = generation_inputs["request_prompts"]
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,
@@ -375,6 +392,12 @@ class OpenAIServingCompletion(OpenAIServing):
                         params=sampling_params,
                     )
                 else:
+                    logger.info(
+                        f"[ENTRYPOINT] Rank {distributed_processor.rank} is generating with engine_client.generate"
+                    )
+                    logger.info(
+                        f"engine_prompt: {engine_prompt}; sampling_params: {sampling_params}; request_id: {request_id}; lora_request: {lora_request}; prompt_adapter_request: {prompt_adapter_request}; trace_headers: {trace_headers}; priority: {priority}"
+                    )
                     generator = self.engine_client.generate(
                         engine_prompt,
                         sampling_params,
@@ -384,6 +407,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         trace_headers=trace_headers,
                         priority=priority,
                     )
+                    logger.info("[ENTRYPOINT] Done generating")
 
                 generators.append(generator)
         except ValueError as e:
@@ -392,15 +416,6 @@ class OpenAIServingCompletion(OpenAIServing):
 
         result_generator = merge_async_iterators(*generators)
 
-        if distributed_processor.rank != 0:
-            # Non-rank 0 processes don't return a response
-            try:
-                async for _ in result_generator:
-                    pass
-            except Exception:
-                logger.exception("Error in non-rank-0 generation")
-            return None
-
         # Similar to the OpenAI API, when n != best_of, we do not stream the
         # results. Noting that best_of is only supported in V0. In addition,
         # we do not stream the results when use beam search.
@@ -408,6 +423,7 @@ class OpenAIServingCompletion(OpenAIServing):
                   and (request.best_of is None or request.n == request.best_of)
                   and not request.use_beam_search)
 
+        logger.info(f"Generating response w/ stream: {stream}")
         # Streaming response
         if stream:
             return self.completion_stream_generator(
@@ -423,6 +439,7 @@ class OpenAIServingCompletion(OpenAIServing):
         # Non-streaming response
         final_res_batch: list[Optional[RequestOutput]] = [None] * num_prompts
         try:
+            logger.info("[ENTRYPOINT] Starting result_generator")
             async for i, res in result_generator:
                 final_res_batch[i] = res
 
@@ -437,7 +454,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
             final_res_batch_checked = cast(list[RequestOutput],
                                            final_res_batch)
-
+            logger.info("[ENTRYPOINT] Done final_res_batch_checked")
             response = self.request_output_to_completion_response(
                 final_res_batch_checked,
                 request,
@@ -447,6 +464,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer,
                 request_metadata,
             )
+            logger.info(
+                "[ENTRYPOINT] Done request_output_to_completion_response")
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:

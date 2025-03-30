@@ -280,6 +280,9 @@ class OpenAIServingChat(OpenAIServing):
         """ Receive request from rank 0 and process through its own engine
         w/ self.engine_client.generate(). Only rank 0 will return a response.
         """
+        logger.info(
+            f"Within creating chat completion for rank {distributed_processor.rank} with distributed processor"
+        )
         if distributed_processor.rank == 0:
             error_check_ret = await self._check_model(request)
             if error_check_ret is not None:
@@ -293,6 +296,9 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         if distributed_processor.rank == 0:
+            logger.info(
+                f"Rank {distributed_processor.rank} is pre-processing chat completion request"
+            )
             try:
                 (
                     lora_request,
@@ -300,7 +306,6 @@ class OpenAIServingChat(OpenAIServing):
                 ) = self._maybe_get_adapters(request)
 
                 model_name = self._get_model_name(request.model, lora_request)
-
                 tokenizer = await self.engine_client.get_tokenizer(lora_request
                                                                    )
 
@@ -354,6 +359,9 @@ class OpenAIServingChat(OpenAIServing):
                     truncate_prompt_tokens=request.truncate_prompt_tokens,
                     add_special_tokens=request.add_special_tokens,
                 )
+                logger.info(
+                    f"Rank {distributed_processor.rank} has pre-processed chat completion request"
+                )
             except ValueError as e:
                 logger.exception("Error in preprocessing prompt inputs")
                 return self.create_error_response(str(e))
@@ -368,6 +376,8 @@ class OpenAIServingChat(OpenAIServing):
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
 
+        logger.info(
+            f"Rank {distributed_processor.rank} is waiting for broadcast")
         try:
             # Broadcast engine_prompts to all ranks
             if distributed_processor.rank == 0:
