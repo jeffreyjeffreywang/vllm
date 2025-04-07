@@ -65,6 +65,7 @@ class OpenAIServingCompletion(OpenAIServing):
         self,
         request: CompletionRequest,
         raw_request: Optional[Request] = None,
+        distributed_processor: Optional[DistributedRequestProcessor] = None,
     ) -> Union[AsyncGenerator[str, None], CompletionResponse, ErrorResponse]:
         """Completion API similar to OpenAI's API.
 
@@ -75,9 +76,10 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
-        error_check_ret = await self._check_model(request)
-        if error_check_ret is not None:
-            return error_check_ret
+        if distributed_processor is None or distributed_processor.rank == 0:
+            error_check_ret = await self._check_model(request)
+            if error_check_ret is not None:
+                return error_check_ret
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -85,10 +87,11 @@ class OpenAIServingCompletion(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        # Return error for unsupported features.
-        if request.suffix is not None:
-            return self.create_error_response(
-                "suffix is not currently supported")
+        if distributed_processor is None or distributed_processor.rank == 0:
+            # Return error for unsupported features.
+            if request.suffix is not None:
+                return self.create_error_response(
+                    "suffix is not currently supported")
 
         request_id = f"cmpl-{self._base_request_id(raw_request)}"
         created_time = int(time.time())
@@ -97,24 +100,47 @@ class OpenAIServingCompletion(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        try:
-            (
-                lora_request,
-                prompt_adapter_request,
-            ) = self._maybe_get_adapters(request)
+        if distributed_processor is None or distributed_processor.rank == 0:
+            try:
+                (
+                    lora_request,
+                    prompt_adapter_request,
+                ) = self._maybe_get_adapters(request)
 
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+                tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-            request_prompts, engine_prompts = await self._preprocess_completion(
-                request,
-                tokenizer,
-                request.prompt,
-                truncate_prompt_tokens=request.truncate_prompt_tokens,
-                add_special_tokens=request.add_special_tokens,
-            )
-        except ValueError as e:
-            logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(str(e))
+                request_prompts, engine_prompts = await self._preprocess_completion(
+                    request,
+                    tokenizer,
+                    request.prompt,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    add_special_tokens=request.add_special_tokens,
+                )
+            except ValueError as e:
+                logger.exception("Error in preprocessing prompt inputs")
+                return self.create_error_response(str(e))
+            
+            model_name = self._get_model_name(request.model, lora_request)
+
+        if distributed_processor is not None:
+            if distributed_processor.rank == 0:
+                generation_inputs = {
+                    "engine_prompts": engine_prompts,
+                    "model_name": model_name,
+                    "lora_request": lora_request,
+                    "prompt_adapter_request": prompt_adapter_request,
+                    "request_prompts": request_prompts,
+                }
+                distributed_processor.broadcast_object(
+                    generation_inputs, distributed_processor.rank, src=0)
+            else:
+                generation_inputs = distributed_processor.broadcast_object(
+                    None, distributed_processor.rank, src=0)
+                engine_prompts = generation_inputs["engine_prompts"]
+                model_name = generation_inputs["model_name"]
+                lora_request = generation_inputs["lora_request"]
+                prompt_adapter_request = generation_inputs["prompt_adapter_request"]
+                request_prompts = generation_inputs["request_prompts"]
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -134,11 +160,12 @@ class OpenAIServingCompletion(OpenAIServing):
 
                 request_id_item = f"{request_id}-{i}"
 
-                self._log_inputs(request_id_item,
-                                 request_prompts[i],
-                                 params=sampling_params,
-                                 lora_request=lora_request,
-                                 prompt_adapter_request=prompt_adapter_request)
+                if distributed_processor is None or distributed_processor.rank == 0:
+                    self._log_inputs(request_id_item,
+                                    request_prompts[i],
+                                    params=sampling_params,
+                                    lora_request=lora_request,
+                                    prompt_adapter_request=prompt_adapter_request)
 
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
@@ -167,7 +194,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         result_generator = merge_async_iterators(*generators)
 
-        model_name = self._get_model_name(request.model, lora_request)
+        # model_name = self._get_model_name(request.model, lora_request)
         num_prompts = len(engine_prompts)
 
         # Similar to the OpenAI API, when n != best_of, we do not stream the
@@ -216,256 +243,6 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer,
                 request_metadata,
             )
-        except asyncio.CancelledError:
-            return self.create_error_response("Client disconnected")
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
-
-        # When user requests streaming but we don't stream, we still need to
-        # return a streaming response with a single event.
-        if request.stream:
-            response_json = response.model_dump_json()
-
-            async def fake_stream_generator() -> AsyncGenerator[str, None]:
-                yield f"data: {response_json}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return fake_stream_generator()
-
-        return response
-
-    async def create_completion_distributed(
-        self,
-        request: CompletionRequest,
-        raw_request: Optional[Request] = None,
-        distributed_processor: Optional[DistributedRequestProcessor] = None,
-    ) -> Union[AsyncGenerator[str, None], CompletionResponse, ErrorResponse]:
-        """Distributed version of the Completion API.
-        
-        Receive request from rank 0 and process through its own engine
-        w/ self.engine_client.generate(). Only rank 0 will return a response.
-        """
-        logger.info(
-            f"Rank {distributed_processor.rank} is starting create_completion_distributed"
-        )
-        if distributed_processor.rank == 0:
-            logger.info(
-                f"Rank {distributed_processor.rank} starting preprocessing")
-            error_check_ret = await self._check_model(request)
-            if error_check_ret is not None:
-                logger.error("Error with model %s", error_check_ret)
-                return error_check_ret
-
-        # If the engine is dead, raise the engine's DEAD_ERROR.
-        # This is required for the streaming case, where we return a
-        # success status before we actually start generating text :).
-        if self.engine_client.errored:
-            raise self.engine_client.dead_error
-
-        if distributed_processor.rank == 0:
-            logger.info(
-                f"Rank {distributed_processor.rank} is pre-processing completion request"
-            )
-            # Return error for unsupported features.
-            if request.suffix is not None:
-                return self.create_error_response(
-                    "suffix is not currently supported")
-
-            request_id = f"cmpl-{self._base_request_id(raw_request)}"
-            created_time = int(time.time())
-
-            request_metadata = RequestResponseMetadata(request_id=request_id)
-            if raw_request:
-                raw_request.state.request_metadata = request_metadata
-            logger.info(f"Request metadata: {request_metadata}")
-
-            try:
-                (
-                    lora_request,
-                    prompt_adapter_request,
-                ) = self._maybe_get_adapters(request)
-
-                tokenizer = await self.engine_client.get_tokenizer(lora_request
-                                                                   )
-
-                request_prompts, engine_prompts = await self._preprocess_completion(
-                    request,
-                    tokenizer,
-                    request.prompt,
-                    truncate_prompt_tokens=request.truncate_prompt_tokens,
-                    add_special_tokens=request.add_special_tokens,
-                )
-            except ValueError as e:
-                logger.exception("Error in preprocessing prompt inputs")
-                return self.create_error_response(str(e))
-
-            model_name = self._get_model_name(request.model, lora_request)
-            num_prompts = len(engine_prompts)
-            logger.info(
-                f"Rank {distributed_processor.rank} has pre-processed completion request; model_name: {model_name}, num_prompts: {num_prompts}"
-            )
-
-        # Schedule the request and get the result generator.
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
-
-        # Broadcast engine_prompts to all ranks
-        if distributed_processor.rank == 0:
-            engine_prompts_to_broadcast = engine_prompts
-        else:
-            engine_prompts_to_broadcast = None
-
-        logger.info(
-            f"Rank {distributed_processor.rank} is broadcasting engine_prompts: {engine_prompts_to_broadcast}"
-        )
-        engine_prompts_to_broadcast = distributed_processor.broadcast_object(
-            engine_prompts_to_broadcast, distributed_processor.rank, src=0)
-
-        num_prompts = len(engine_prompts_to_broadcast)
-        try:
-            for i, engine_prompt in enumerate(engine_prompts_to_broadcast):
-                if distributed_processor.rank == 0:
-                    sampling_params: Union[SamplingParams, BeamSearchParams]
-                    default_max_tokens = self.max_model_len - len(
-                        engine_prompt["prompt_token_ids"])
-                    if request.use_beam_search:
-                        sampling_params = request.to_beam_search_params(
-                            default_max_tokens, self.default_sampling_params)
-                    else:
-                        sampling_params = request.to_sampling_params(
-                            default_max_tokens,
-                            self.model_config.logits_processor_pattern,
-                            self.default_sampling_params)
-
-                    request_id_item = f"{request_id}-{i}"
-
-                    self._log_inputs(
-                        request_id_item,
-                        request_prompts[i],
-                        params=sampling_params,
-                        lora_request=lora_request,
-                        prompt_adapter_request=prompt_adapter_request)
-
-                    trace_headers = (None if raw_request is None else await
-                                     self._get_trace_headers(
-                                         raw_request.headers))
-
-                    priority = request.priority
-
-                    # Broadcast all necessary generation inputs to other ranks
-                    generation_inputs = distributed_processor.broadcast_object(
-                        {
-                            "engine_prompt": engine_prompt,
-                            "sampling_params": sampling_params,
-                            "request_id": request_id,
-                            "request_id_item": request_id_item,
-                            "lora_request": lora_request,
-                            "trace_headers": trace_headers,
-                            "prompt_adapter_request": prompt_adapter_request,
-                            "priority": priority,
-                            "model_name": model_name,
-                            "request_prompts": request_prompts,
-                        },
-                        distributed_processor.rank,
-                        src=0,
-                    )
-                else:
-                    generation_inputs = distributed_processor.broadcast_object(
-                        None, distributed_processor.rank, src=0)
-                    logger.info(
-                        f"Received generation inputs: {generation_inputs}")
-                    engine_prompt = generation_inputs["engine_prompt"]
-                    sampling_params = generation_inputs["sampling_params"]
-                    request_id = generation_inputs["request_id"]
-                    request_id_item = generation_inputs["request_id_item"]
-                    lora_request = generation_inputs["lora_request"]
-                    trace_headers = generation_inputs["trace_headers"]
-                    prompt_adapter_request = generation_inputs[
-                        "prompt_adapter_request"]
-                    priority = generation_inputs["priority"]
-                    model_name = generation_inputs["model_name"]
-                    request_prompts = generation_inputs["request_prompts"]
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.engine_client.beam_search(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        params=sampling_params,
-                    )
-                else:
-                    logger.info(
-                        f"[ENTRYPOINT] Rank {distributed_processor.rank} is generating with engine_client.generate"
-                    )
-                    logger.info(
-                        f"engine_prompt: {engine_prompt}; sampling_params: {sampling_params}; request_id: {request_id}; lora_request: {lora_request}; prompt_adapter_request: {prompt_adapter_request}; trace_headers: {trace_headers}; priority: {priority}"
-                    )
-                    generator = self.engine_client.generate(
-                        engine_prompt,
-                        sampling_params,
-                        request_id_item,
-                        lora_request=lora_request,
-                        prompt_adapter_request=prompt_adapter_request,
-                        trace_headers=trace_headers,
-                        priority=priority,
-                    )
-                    logger.info("[ENTRYPOINT] Done generating")
-
-                generators.append(generator)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
-
-        result_generator = merge_async_iterators(*generators)
-
-        # Similar to the OpenAI API, when n != best_of, we do not stream the
-        # results. Noting that best_of is only supported in V0. In addition,
-        # we do not stream the results when use beam search.
-        stream = (request.stream
-                  and (request.best_of is None or request.n == request.best_of)
-                  and not request.use_beam_search)
-
-        logger.info(f"Generating response w/ stream: {stream}")
-        # Streaming response
-        if stream:
-            return self.completion_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                created_time,
-                model_name,
-                num_prompts=num_prompts,
-                tokenizer=tokenizer,
-                request_metadata=request_metadata)
-
-        # Non-streaming response
-        final_res_batch: list[Optional[RequestOutput]] = [None] * num_prompts
-        try:
-            logger.info("[ENTRYPOINT] Starting result_generator")
-            async for i, res in result_generator:
-                final_res_batch[i] = res
-
-            for i, final_res in enumerate(final_res_batch):
-                assert final_res is not None
-
-                # The output should contain the input text
-                # We did not pass it into vLLM engine to avoid being redundant
-                # with the inputs token IDs
-                if final_res.prompt is None:
-                    final_res.prompt = request_prompts[i]["prompt"]
-
-            final_res_batch_checked = cast(list[RequestOutput],
-                                           final_res_batch)
-            logger.info("[ENTRYPOINT] Done final_res_batch_checked")
-            response = self.request_output_to_completion_response(
-                final_res_batch_checked,
-                request,
-                request_id,
-                created_time,
-                model_name,
-                tokenizer,
-                request_metadata,
-            )
-            logger.info(
-                "[ENTRYPOINT] Done request_output_to_completion_response")
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:

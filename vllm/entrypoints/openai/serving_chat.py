@@ -118,6 +118,7 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request: ChatCompletionRequest,
         raw_request: Optional[Request] = None,
+        distributed_processor: Optional[DistributedRequestProcessor] = None,
     ) -> Union[AsyncGenerator[str, None], ChatCompletionResponse,
                ErrorResponse]:
         """
@@ -127,10 +128,11 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
-        error_check_ret = await self._check_model(request)
-        if error_check_ret is not None:
-            logger.error("Error with model %s", error_check_ret)
-            return error_check_ret
+        if distributed_processor is None or distributed_processor.rank == 0:
+            error_check_ret = await self._check_model(request)
+            if error_check_ret is not None:
+                logger.error("Error with model %s", error_check_ret)
+                return error_check_ret
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
@@ -138,67 +140,68 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        try:
-            (
-                lora_request,
-                prompt_adapter_request,
-            ) = self._maybe_get_adapters(request)
+        if distributed_processor is None or distributed_processor.rank == 0:
+            try:
+                (
+                    lora_request,
+                    prompt_adapter_request,
+                ) = self._maybe_get_adapters(request)
 
-            model_name = self._get_model_name(request.model, lora_request)
+                model_name = self._get_model_name(request.model, lora_request)
 
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+                tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
-            tool_parser = self.tool_parser
+                tool_parser = self.tool_parser
 
-            # validation for OpenAI tools
-            # tool_choice = "required" is not supported
-            if request.tool_choice == "required":
-                return self.create_error_response(
-                    "tool_choice = \"required\" is not supported!")
+                # validation for OpenAI tools
+                # tool_choice = "required" is not supported
+                if request.tool_choice == "required":
+                    return self.create_error_response(
+                        "tool_choice = \"required\" is not supported!")
 
-            if isinstance(tokenizer, MistralTokenizer):
-                # because of issues with pydantic we need to potentially
-                # re-serialize the tool_calls field of the request
-                # for more info: see comment in `maybe_serialize_tool_calls`
-                maybe_serialize_tool_calls(request)
-                truncate_tool_call_ids(request)
+                if isinstance(tokenizer, MistralTokenizer):
+                    # because of issues with pydantic we need to potentially
+                    # re-serialize the tool_calls field of the request
+                    # for more info: see comment in `maybe_serialize_tool_calls`
+                    maybe_serialize_tool_calls(request)
+                    truncate_tool_call_ids(request)
 
-            if (request.tool_choice == "auto" and
-                    not (self.enable_auto_tools and tool_parser is not None)
-                    and not isinstance(tokenizer, MistralTokenizer)):
-                # for hf tokenizers, "auto" tools requires
-                # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response(
-                    "\"auto\" tool choice requires "
-                    "--enable-auto-tool-choice and --tool-call-parser to be set"
+                if (request.tool_choice == "auto" and
+                        not (self.enable_auto_tools and tool_parser is not None)
+                        and not isinstance(tokenizer, MistralTokenizer)):
+                    # for hf tokenizers, "auto" tools requires
+                    # --enable-auto-tool-choice and --tool-call-parser
+                    return self.create_error_response(
+                        "\"auto\" tool choice requires "
+                        "--enable-auto-tool-choice and --tool-call-parser to be set"
+                    )
+
+                tool_dicts = None if request.tools is None else [
+                    tool.model_dump() for tool in request.tools
+                ]
+
+                (
+                    conversation,
+                    request_prompts,
+                    engine_prompts,
+                ) = await self._preprocess_chat(
+                    request,
+                    tokenizer,
+                    request.messages,
+                    chat_template=request.chat_template or self.chat_template,
+                    chat_template_content_format=self.chat_template_content_format,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message,
+                    tool_dicts=tool_dicts,
+                    documents=request.documents,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    tool_parser=tool_parser,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    add_special_tokens=request.add_special_tokens,
                 )
-
-            tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
-            ]
-
-            (
-                conversation,
-                request_prompts,
-                engine_prompts,
-            ) = await self._preprocess_chat(
-                request,
-                tokenizer,
-                request.messages,
-                chat_template=request.chat_template or self.chat_template,
-                chat_template_content_format=self.chat_template_content_format,
-                add_generation_prompt=request.add_generation_prompt,
-                continue_final_message=request.continue_final_message,
-                tool_dicts=tool_dicts,
-                documents=request.documents,
-                chat_template_kwargs=request.chat_template_kwargs,
-                tool_parser=tool_parser,
-                truncate_prompt_tokens=request.truncate_prompt_tokens,
-                add_special_tokens=request.add_special_tokens,
-            )
-        except ValueError as e:
-            logger.exception("Error in preprocessing prompt inputs")
-            return self.create_error_response(str(e))
+            except ValueError as e:
+                logger.exception("Error in preprocessing prompt inputs")
+                return self.create_error_response(str(e))
 
         request_id = "chatcmpl-" \
                      f"{self._base_request_id(raw_request, request.request_id)}"
@@ -206,6 +209,28 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
+
+        if distributed_processor is not None:
+            if distributed_processor.rank == 0:
+                generation_inputs = {
+                    "engine_prompts": engine_prompts,
+                    "model_name": model_name,
+                    "lora_request": lora_request,
+                    "prompt_adapter_request": prompt_adapter_request,
+                    "request_prompts": request_prompts,
+                    "conversation": conversation,
+                }
+                distributed_processor.broadcast_object(
+                    generation_inputs, distributed_processor.rank, src=0)
+            else:
+                generation_inputs = distributed_processor.broadcast_object(
+                    None, distributed_processor.rank, src=0)
+                engine_prompts = generation_inputs["engine_prompts"]
+                model_name = generation_inputs["model_name"]
+                lora_request = generation_inputs["lora_request"]
+                prompt_adapter_request = generation_inputs["prompt_adapter_request"]
+                request_prompts = generation_inputs["request_prompts"]
+                conversation = generation_inputs["conversation"]
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -223,11 +248,12 @@ class OpenAIServingChat(OpenAIServing):
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
 
-                self._log_inputs(request_id,
-                                 request_prompts[i],
-                                 params=sampling_params,
-                                 lora_request=lora_request,
-                                 prompt_adapter_request=prompt_adapter_request)
+                if distributed_processor is None or distributed_processor.rank == 0:
+                    self._log_inputs(request_id,
+                                    request_prompts[i],
+                                    params=sampling_params,
+                                    lora_request=lora_request,
+                                    prompt_adapter_request=prompt_adapter_request)
 
                 trace_headers = (None if raw_request is None else await
                                  self._get_trace_headers(raw_request.headers))
@@ -247,226 +273,6 @@ class OpenAIServingChat(OpenAIServing):
                         trace_headers=trace_headers,
                         prompt_adapter_request=prompt_adapter_request,
                         priority=request.priority,
-                    )
-
-                generators.append(generator)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
-
-        assert len(generators) == 1
-        result_generator, = generators
-
-        # Streaming response
-        if request.stream:
-            return self.chat_completion_stream_generator(
-                request, result_generator, request_id, model_name,
-                conversation, tokenizer, request_metadata)
-
-        try:
-            return await self.chat_completion_full_generator(
-                request, result_generator, request_id, model_name,
-                conversation, tokenizer, request_metadata)
-        except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
-
-    async def create_chat_completion_distributed(
-        self,
-        request: ChatCompletionRequest,
-        raw_request: Optional[Request],
-        distributed_processor: Optional[DistributedRequestProcessor],
-    ):
-        """ Receive request from rank 0 and process through its own engine
-        w/ self.engine_client.generate(). Only rank 0 will return a response.
-        """
-        logger.info(
-            f"Within creating chat completion for rank {distributed_processor.rank} with distributed processor"
-        )
-        if distributed_processor.rank == 0:
-            error_check_ret = await self._check_model(request)
-            if error_check_ret is not None:
-                logger.error("Error with model %s", error_check_ret)
-                return error_check_ret
-
-        # If the engine is dead, raise the engine's DEAD_ERROR.
-        # This is required for the streaming case, where we return a
-        # success status before we actually start generating text :).
-        if self.engine_client.errored:
-            raise self.engine_client.dead_error
-
-        if distributed_processor.rank == 0:
-            logger.info(
-                f"Rank {distributed_processor.rank} is pre-processing chat completion request"
-            )
-            try:
-                (
-                    lora_request,
-                    prompt_adapter_request,
-                ) = self._maybe_get_adapters(request)
-
-                model_name = self._get_model_name(request.model, lora_request)
-                tokenizer = await self.engine_client.get_tokenizer(lora_request
-                                                                   )
-
-                tool_parser = self.tool_parser
-
-                # validation for OpenAI tools
-                # tool_choice = "required" is not supported
-                if request.tool_choice == "required":
-                    return self.create_error_response(
-                        "tool_choice = \"required\" is not supported!")
-
-                if isinstance(tokenizer, MistralTokenizer):
-                    # because of issues with pydantic we need to potentially
-                    # re-serialize the tool_calls field of the request
-                    # for more info: see comment in `maybe_serialize_tool_calls`
-                    maybe_serialize_tool_calls(request)
-                    truncate_tool_call_ids(request)
-
-                if (request.tool_choice == "auto"
-                        and not (self.enable_auto_tools
-                                 and tool_parser is not None)
-                        and not isinstance(tokenizer, MistralTokenizer)):
-                    # for hf tokenizers, "auto" tools requires
-                    # --enable-auto-tool-choice and --tool-call-parser
-                    return self.create_error_response(
-                        "\"auto\" tool choice requires "
-                        "--enable-auto-tool-choice and "
-                        "--tool-call-parser to be set")
-
-                tool_dicts = None if request.tools is None else [
-                    tool.model_dump() for tool in request.tools
-                ]
-
-                (
-                    conversation,
-                    request_prompts,
-                    engine_prompts,
-                ) = await self._preprocess_chat(
-                    request,
-                    tokenizer,
-                    request.messages,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_content_format=self.
-                    chat_template_content_format,
-                    add_generation_prompt=request.add_generation_prompt,
-                    continue_final_message=request.continue_final_message,
-                    tool_dicts=tool_dicts,
-                    documents=request.documents,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    tool_parser=tool_parser,
-                    truncate_prompt_tokens=request.truncate_prompt_tokens,
-                    add_special_tokens=request.add_special_tokens,
-                )
-                logger.info(
-                    f"Rank {distributed_processor.rank} has pre-processed chat completion request"
-                )
-            except ValueError as e:
-                logger.exception("Error in preprocessing prompt inputs")
-                return self.create_error_response(str(e))
-
-            request_id = "chatcmpl-" \
-                    f"{self._base_request_id(raw_request, request.request_id)}"
-
-            request_metadata = RequestResponseMetadata(request_id=request_id)
-            if raw_request:
-                raw_request.state.request_metadata = request_metadata
-
-        # Schedule the request and get the result generator.
-        generators: list[AsyncGenerator[RequestOutput, None]] = []
-
-        logger.info(
-            f"Rank {distributed_processor.rank} is waiting for broadcast")
-        try:
-            # Broadcast engine_prompts to all ranks
-            if distributed_processor.rank == 0:
-                engine_prompts_to_broadcast = engine_prompts
-            else:
-                engine_prompts_to_broadcast = None
-
-            engine_prompts_to_broadcast = distributed_processor.broadcast_object(
-                engine_prompts_to_broadcast,
-                distributed_processor.rank,
-            )
-
-            logger.info(
-                f"Rank {distributed_processor.rank} is broadcasting engine_prompts: {engine_prompts_to_broadcast}"
-            )
-
-            for i, engine_prompt in enumerate(engine_prompts_to_broadcast):
-                if distributed_processor.rank == 0:
-                    sampling_params: Union[SamplingParams, BeamSearchParams]
-                    default_max_tokens = self.max_model_len - len(
-                        engine_prompt["prompt_token_ids"])
-                    if request.use_beam_search:
-                        sampling_params = request.to_beam_search_params(
-                            default_max_tokens, self.default_sampling_params)
-                    else:
-                        sampling_params = request.to_sampling_params(
-                            default_max_tokens,
-                            self.model_config.logits_processor_pattern,
-                            self.default_sampling_params)
-
-                    self._log_inputs(
-                        request_id,
-                        request_prompts[i],
-                        params=sampling_params,
-                        lora_request=lora_request,
-                        prompt_adapter_request=prompt_adapter_request)
-
-                    trace_headers = (None if raw_request is None else await
-                                     self._get_trace_headers(
-                                         raw_request.headers))
-
-                    priority = request.priority
-
-                    logger.info(
-                        f"Rank {distributed_processor.rank} is broadcasting engine_prompt: {engine_prompt}"
-                    )
-                    # Broadcast all necessary generation inputs to other ranks
-                    generation_inputs = distributed_processor.broadcast_object(
-                        engine_prompt=engine_prompt,
-                        sampling_params=sampling_params,
-                        request_id=request_id,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        prompt_adapter_request=prompt_adapter_request,
-                        priority=priority,
-                    )
-                else:
-                    generation_inputs = distributed_processor.broadcast_object(
-                    )
-                    engine_prompt = generation_inputs["engine_prompt"]
-                    sampling_params = generation_inputs["sampling_params"]
-                    request_id = generation_inputs["request_id"]
-                    lora_request = generation_inputs["lora_request"]
-                    trace_headers = generation_inputs["trace_headers"]
-                    prompt_adapter_request = generation_inputs[
-                        "prompt_adapter_request"]
-                    priority = generation_inputs["priority"]
-                    logger.info(
-                        f"Rank {distributed_processor.rank} is receiving engine_prompt: {engine_prompt}"
-                    )
-
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.engine_client.beam_search(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        params=sampling_params,
-                    )
-                else:
-                    logger.info(
-                        f"Rank {distributed_processor.rank} is generating with engine_prompt: {engine_prompt}, \
-                                generation_inputs: {generation_inputs}")
-                    generator = self.engine_client.generate(
-                        engine_prompt,
-                        sampling_params,
-                        request_id,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        prompt_adapter_request=prompt_adapter_request,
-                        priority=priority,
                     )
 
                 generators.append(generator)

@@ -416,12 +416,8 @@ async def create_chat_completion(request: ChatCompletionRequest,
         return base(raw_request).create_error_response(
             message="The model does not support Chat Completions API")
 
-    distributed_processor = raw_request.app.state.distributed_processor
-    if distributed_processor is not None:
-        generator = await handler.create_chat_completion_distributed(
-            request, raw_request, distributed_processor)
-    else:
-        generator = await handler.create_chat_completion(request, raw_request)
+    generator = await handler.create_chat_completion(
+        request, raw_request, raw_request.app.state.distributed_processor)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -441,15 +437,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return base(raw_request).create_error_response(
             message="The model does not support Completions API")
 
-    distributed_processor = raw_request.app.state.distributed_processor
-    if distributed_processor is not None:
-        logger.info(
-            f"Creating completion for rank {distributed_processor.rank} with distributed processor"
-        )
-        generator = await handler.create_completion_distributed(
-            request, raw_request, distributed_processor)
-    else:
-        generator = await handler.create_completion(request, raw_request)
+    generator = await handler.create_completion(
+        request, raw_request, raw_request.app.state.distributed_processor)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(content=generator.model_dump(),
@@ -1032,17 +1021,23 @@ async def run_server(args, **uvicorn_kwargs) -> None:
                 f"Rank {rank} initialized and waiting for requests from rank 0"
             )
 
-            completion_handler = app.state.openai_serving_completion
-            dummy_completion_request = CompletionRequest(model="dummy",
-                                                         prompt="")
+            # completion_handler = app.state.openai_serving_completion
+            # dummy_completion_request = CompletionRequest(model="dummy", prompt="")
+
+            chat_handler = app.state.openai_serving_chat
+            dummy_chat_request = ChatCompletionRequest(model="dummy", messages=[{"role": "user", "content": "Hello, world!"}])
 
             # Keep the process alive to participate in distributed processing
             try:
                 while True:
                     try:
                         # Process completion requests
-                        result = await completion_handler.create_completion_distributed(
-                            dummy_completion_request, None,
+                        # result = await completion_handler.create_ompletion(
+                        #     dummy_completion_request, None,
+                        #     app.state.distributed_processor)
+                        
+                        result = await chat_handler.create_chat_completion(
+                            dummy_chat_request, None,
                             app.state.distributed_processor)
 
                         async for _ in result:
